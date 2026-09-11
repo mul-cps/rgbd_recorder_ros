@@ -1,0 +1,13 @@
+rgbd_recorder:
+  ros__parameters:
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    color_info_topic: /camera/color/camera_info
+    depth_info_topic: /camera/aligned_depth_to_color/camera_info
+    base_frame: map
+    camera_frame: ''            # empty -> use image header frame_id
+    output_dir: ~/rgbd_dataset
+    depth_scale_to_mm: 1000.0   # used when depth is 32FC1 (metres)
+    sync_slop: 0.05             # colour/depth sync tolerance [s]
+    depth_vis_max_mm: 5000.0    # colormap range for visualisation
+    color_format: png           # png (lossless) or jpg (small)
