@@ -26,6 +26,7 @@ Output layout:
 
 import json
 import os
+import queue
 import sys
 import threading
 from datetime import datetime
@@ -129,6 +130,14 @@ class RGBDRecorder(Node):
         self.depth_info = None
         self.depth_to_color = None      # orbbec extrinsics msg
         self.metadata_written = False
+
+        # Recording I/O is performed by a dedicated worker thread.
+        # The bounded queue prevents unbounded memory growth if the
+        # storage device cannot sustain the incoming data rate.
+        self._write_queue = None
+        self._writer_thread = None
+        self._write_queue_size = 100
+        self._dropped_frames = 0
 
         # Format validation (done once, on the first synchronized frame)
         self.formats_validated = False
@@ -336,19 +345,46 @@ class RGBDRecorder(Node):
 
         self.frame_count = 0
         self.metadata_written = False
+        self._dropped_frames = 0
+        self._write_queue = queue.Queue(
+            maxsize=self._write_queue_size)
+
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name='rgbd-writer',
+            daemon=True)
+        self._writer_thread.start()
+
         self.recording = True
         msg = f'Recording started -> {self.session_dir}'
         self.get_logger().info(msg)
         self.bridge_qt.log_message.emit(msg)
 
     def _stop_recording(self):
+        # Stop accepting new frames. The caller holds self._lock, so
+        # rgbd_callback cannot enqueue more frames while we drain the queue.
         self.recording = False
+
+        if self._write_queue is not None:
+            # FIFO sentinel: queued frames are processed before exit.
+            self._write_queue.put(None)
+
+        if self._writer_thread is not None:
+            self._writer_thread.join()
+
         for f in (self.poses_file, self.assoc_file):
             if f:
                 f.close()
         self.poses_file = self.assoc_file = None
+        self._write_queue = None
+        self._writer_thread = None
+
         msg = (f'Recording stopped. {self.frame_count} frames '
                f'saved to {self.session_dir}')
+        if self._dropped_frames:
+            msg += (
+                f' ({self._dropped_frames} RGB-D pairs dropped: '
+                f'queue full)')
         self.get_logger().info(msg)
         self.bridge_qt.log_message.emit(msg)
 
@@ -356,6 +392,22 @@ class RGBDRecorder(Node):
         with self._lock:
             if self.recording:
                 self._stop_recording()
+
+    def _writer_loop(self):
+        """Write queued RGB-D pairs without blocking ROS image callbacks."""
+        while True:
+            item = self._write_queue.get()
+            try:
+                if item is None:
+                    return
+
+                color_msg, depth_msg = item
+                self._save_frame(color_msg, depth_msg)
+            except Exception as e:
+                self.get_logger().error(
+                    f'Failed to save RGB-D frame: {e}')
+            finally:
+                self._write_queue.task_done()
 
     def write_metadata(self, color_fmt: str, depth_fmt: str):
         intr = {}
@@ -408,11 +460,21 @@ class RGBDRecorder(Node):
             if not self._validate_formats(color_msg, depth_msg):
                 return          # fatal_error signal already emitted
 
-        # ---- Export: raw bytes, no conversion ----
+        # ---- Export: enqueue raw messages; never do disk I/O here ----
         with self._lock:
-            if self.recording:
-                self._save_frame(color_msg, depth_msg)
-            rec, count = self.recording, self.frame_count
+            rec = self.recording
+            if rec and self._write_queue is not None:
+                try:
+                    self._write_queue.put_nowait(
+                        (color_msg, depth_msg))
+                except queue.Full:
+                    self._dropped_frames += 1
+                    if (self._dropped_frames == 1 or
+                            self._dropped_frames % 100 == 0):
+                        self.get_logger().warning(
+                            f'Recording queue full; dropped '
+                            f'{self._dropped_frames} RGB-D pairs.')
+            count = self.frame_count
 
         # ---- Preview: decode only for display ----
         color = cv2.imdecode(
