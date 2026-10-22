@@ -106,7 +106,7 @@ class RGBDRecorder(Node):
         self.declare_parameter('base_frame', 'map')
         self.declare_parameter('camera_frame', '')   # empty -> header frame_id
         self.declare_parameter('output_dir', '~/rgbd_dataset')
-        self.declare_parameter('sync_slop', 0.05)
+        self.declare_parameter('sync_slop', 0.01)
         self.declare_parameter('depth_vis_max_mm', 5000.0)
         self.declare_parameter('watchdog_timeout', 5.0)
 
