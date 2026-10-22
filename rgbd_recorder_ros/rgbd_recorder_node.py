@@ -419,10 +419,15 @@ class RGBDRecorder(Node):
             np.frombuffer(color_msg.data, np.uint8), cv2.IMREAD_COLOR)
         depth = cv2.imdecode(
             np.frombuffer(depth_msg.data, np.uint8), cv2.IMREAD_UNCHANGED)
-        if color is None or depth is None:
-            self.get_logger().warning('Failed to decode compressed image '
-                                      'for preview',
-                                      throttle_duration_sec=2.0)
+        if color is None:
+            self.get_logger().warning(
+                'Failed to decode compressed color image',
+                throttle_duration_sec=2.0)
+            return
+        if depth is None:
+            self.get_logger().warning(
+                'Failed to decode compressed depth image',
+                throttle_duration_sec=2.0)
             return
         if depth.dtype != np.uint16:
             depth = depth.astype(np.uint16)
