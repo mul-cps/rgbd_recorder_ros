@@ -468,6 +468,7 @@ class RecorderWindow(QMainWindow):
         self.node = node
         self.recording = False
         self.blink_on = False
+        self._fatal_error_shown = False
 
         self.setWindowTitle('RGB-D Recorder — waiting for images…')
         self.resize(1280, 540)
@@ -566,6 +567,11 @@ class RecorderWindow(QMainWindow):
     #  Fatal error slot — runs in the GUI thread                         #
     # ------------------------------------------------------------------ #
     def on_fatal_error(self, msg):
+        if self._fatal_error_shown:
+            return
+
+        self._fatal_error_shown = True
+
         self.node.stop_if_recording()
         QMessageBox.critical(self, 'RGB-D Recorder — fatal error', msg)
         QApplication.exit(1)
