@@ -10,6 +10,8 @@ RGB-D recorder node with Qt6 (PySide6) GUI — compressed transport version.
   (no decode/re-encode); decoding happens only for the live preview.
 - Also records intrinsics (CameraInfo), depth->colour extrinsics
   (orbbec_camera_msgs/Extrinsics, if available) and TF camera poses.
+- Reception watchdog: shows a GUI warning banner if no images arrive
+  within `watchdog_timeout` seconds — from startup and during operation.
 - SPACE toggles recording, Q/ESC quits. Output dirs created automatically.
 
 Output layout:
@@ -32,6 +34,7 @@ import cv2
 import numpy as np
 import rclpy
 from message_filters import ApproximateTimeSynchronizer, Subscriber
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -81,6 +84,7 @@ class RosQtBridge(QObject):
     frame_ready = Signal(object, object, bool, int)
     log_message = Signal(str)
     fatal_error = Signal(str)
+    data_timeout = Signal(bool, float)   # (timed_out, secs since last image)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +108,7 @@ class RGBDRecorder(Node):
         self.declare_parameter('output_dir', '~/rgbd_dataset')
         self.declare_parameter('sync_slop', 0.05)
         self.declare_parameter('depth_vis_max_mm', 5000.0)
+        self.declare_parameter('watchdog_timeout', 5.0)
 
         gp = self.get_parameter
         self.base_frame = gp('base_frame').value
@@ -137,10 +142,28 @@ class RGBDRecorder(Node):
         # ---------------- Subscribers ----------------
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
-        self.color_sub = Subscriber(self, CompressedImage,
-                                    gp('color_topic').value, qos_profile=qos)
-        self.depth_sub = Subscriber(self, CompressedImage,
-                                    gp('depth_topic').value, qos_profile=qos)
+        # message_filters is NOT thread-safe: force colour/depth callbacks
+        # to never run concurrently, even under MultiThreadedExecutor.
+        self.sync_group = MutuallyExclusiveCallbackGroup()
+
+        # Reception diagnostics
+        self.n_color = 0
+        self.n_depth = 0
+        self.n_sync = 0
+        self._last_color_stamp = 0.0
+        self._last_depth_stamp = 0.0
+
+        self.color_sub = Subscriber(
+            self, CompressedImage, gp('color_topic').value,
+            qos_profile=qos, callback_group=self.sync_group)
+        self.depth_sub = Subscriber(
+            self, CompressedImage, gp('depth_topic').value,
+            qos_profile=qos, callback_group=self.sync_group)
+
+        # Count raw arrivals without disturbing the synchronizer
+        self.color_sub.registerCallback(self._count_color)
+        self.depth_sub.registerCallback(self._count_depth)
+
         self.sync = ApproximateTimeSynchronizer(
             [self.color_sub, self.depth_sub],
             queue_size=10, slop=gp('sync_slop').value)
@@ -162,9 +185,66 @@ class RGBDRecorder(Node):
 
         self.create_service(SetBool, '~/set_recording', self.set_recording_cb)
 
+        # Periodic diagnostics: tells you exactly where messages stop
+        self.diag_timer = self.create_timer(3.0, self._diag)
+
+        # ---------------- Reception watchdog ----------------
+        self.watchdog_timeout = gp('watchdog_timeout').value
+        # Initialise to "now" so the watchdog also triggers if NOTHING
+        # ever arrives after startup.
+        self._last_rx_time_color = self.get_clock().now()
+        self._last_rx_time_depth = self.get_clock().now()
+        self._timeout_active = False
+        # Check at 1 Hz — a fired warning is refreshed every second with
+        # the updated outage duration.
+        self.watchdog_timer = self.create_timer(1.0, self._watchdog_check)
+
         self.get_logger().info(
             f'RGB-D recorder ready (compressed transport). '
             f'Output root: {self.output_root}')
+
+    # ------------------------------------------------------------------ #
+    #  Reception diagnostics + watchdog                                   #
+    # ------------------------------------------------------------------ #
+    def _count_color(self, msg):
+        self.n_color += 1
+        self._last_color_stamp = stamp_to_sec(msg.header.stamp)
+        self._last_rx_time_color = self.get_clock().now()
+
+    def _count_depth(self, msg):
+        self.n_depth += 1
+        self._last_depth_stamp = stamp_to_sec(msg.header.stamp)
+        self._last_rx_time_depth = self.get_clock().now()
+
+    def _diag(self):
+        dt = None
+        if self.n_color and self.n_depth:
+            dt = abs(self._last_color_stamp - self._last_depth_stamp)
+        self.get_logger().debug(
+            f'rx color={self.n_color} depth={self.n_depth} '
+            f'synced={self.n_sync}'
+            + (f'  |stamp diff|={dt:.3f}s' if dt is not None else ''))
+
+    def _watchdog_check(self):
+        now = self.get_clock().now()
+        elapsed_color = (now - self._last_rx_time_color).nanoseconds * 1e-9
+        elapsed_depth = (now - self._last_rx_time_depth).nanoseconds * 1e-9
+
+        if (elapsed_color >= self.watchdog_timeout) or (elapsed_depth >= self.watchdog_timeout):
+            # (Re-)emit every second so the GUI can show a live counter
+            # and so the log reflects an ongoing outage.
+            self._timeout_active = True
+            self.get_logger().warning(
+                f'No images received for {self.watchdog_timeout:.0f} s '
+                f'(last color {elapsed_color:.0f} s ago, last depth {elapsed_depth:.0f} s ago). '
+                f'Camera disconnected or topics not publishing?',
+                throttle_duration_sec=5.0)
+            self.bridge_qt.data_timeout.emit(True, self.watchdog_timeout)
+        elif self._timeout_active:
+            # Data resumed — clear the warning exactly once.
+            self._timeout_active = False
+            self.get_logger().info('Image reception resumed.')
+            self.bridge_qt.data_timeout.emit(False, 0.0)
 
     # ------------------------------------------------------------------ #
     #  Info / extrinsics callbacks                                       #
@@ -321,6 +401,8 @@ class RGBDRecorder(Node):
     # ------------------------------------------------------------------ #
     def rgbd_callback(self, color_msg: CompressedImage,
                       depth_msg: CompressedImage):
+        self.n_sync += 1
+
         # ---- One-time format validation ----
         if not self.formats_validated:
             if not self._validate_formats(color_msg, depth_msg):
@@ -339,7 +421,8 @@ class RGBDRecorder(Node):
             np.frombuffer(depth_msg.data, np.uint8), cv2.IMREAD_UNCHANGED)
         if color is None or depth is None:
             self.get_logger().warning('Failed to decode compressed image '
-                                   'for preview', throttle_duration_sec=2.0)
+                                      'for preview',
+                                      throttle_duration_sec=2.0)
             return
         if depth.dtype != np.uint16:
             depth = depth.astype(np.uint16)
@@ -412,9 +495,18 @@ class RecorderWindow(QMainWindow):
         header.addWidget(self.rec_text)
         header.addStretch()
 
+        # --- data timeout warning banner ---
+        self.warn_banner = QLabel()
+        self.warn_banner.setAlignment(Qt.AlignCenter)
+        self.warn_banner.setStyleSheet(
+            'background-color: #aa6600; color: white; '
+            'font-size: 14px; font-weight: bold; padding: 6px;')
+        self.warn_banner.hide()
+
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addLayout(header)
+        layout.addWidget(self.warn_banner)
         layout.addWidget(self.image_label, stretch=1)
         self.setCentralWidget(central)
 
@@ -427,6 +519,7 @@ class RecorderWindow(QMainWindow):
         bridge.frame_ready.connect(self.on_frame)
         bridge.log_message.connect(self.status.showMessage)
         bridge.fatal_error.connect(self.on_fatal_error)
+        bridge.data_timeout.connect(self.on_data_timeout)
 
         # --- blink timer for REC dot ---
         self.blink_timer = QTimer(self)
@@ -447,6 +540,27 @@ class RecorderWindow(QMainWindow):
             self._set_dot(self.blink_on)
         else:
             self._set_dot(False)
+
+    # ------------------------------------------------------------------ #
+    #  Data timeout slot — runs in the GUI thread                        #
+    # ------------------------------------------------------------------ #
+    def on_data_timeout(self, timed_out: bool, elapsed: float):
+        if timed_out:
+            self.warn_banner.setText(
+                f'⚠  No images received for {elapsed:.0f} s — '
+                f'check camera connection / topics')
+            self.warn_banner.show()
+            if not self.recording:
+                self.image_label.setStyleSheet(
+                    'background-color: #202020; color: #aaaaaa; '
+                    'border: 3px solid #aa6600; font-size: 16px;')
+        else:
+            self.warn_banner.hide()
+            self.status.showMessage('Image reception resumed.', 5000)
+            if not self.recording:
+                self.image_label.setStyleSheet(
+                    'background-color: #202020; color: #aaaaaa; '
+                    'font-size: 16px;')
 
     # ------------------------------------------------------------------ #
     #  Fatal error slot — runs in the GUI thread                         #
