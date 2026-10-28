@@ -105,15 +105,12 @@ class RGBDRecorder(Node):
         self.watchdog_timeout = self.declare_parameter('watchdog_timeout', 5.0).value
 
         # gp = self.get_parameter
-        # Expand ~ and env vars, create the root folder right away
+        # Expand ~ and env vars
         self.output_root = os.path.expandvars(os.path.expanduser(self.output_dir))
-        os.makedirs(self.output_root, exist_ok=True)
 
         # One session per process invocation, shared by sequences and captures.
         session_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         self.session_dir = os.path.join(self.output_root, session_stamp)
-        os.makedirs(os.path.join(self.session_dir, 'rgb'), exist_ok=True)
-        os.makedirs(os.path.join(self.session_dir, 'depth'), exist_ok=True)
 
         # ---------------- State ----------------
         self._lock = threading.Lock()
@@ -331,6 +328,9 @@ class RGBDRecorder(Node):
         rgb_name = f'rgb/{rgb_file}'
         depth_name = f'depth/{depth_file}'
 
+        os.makedirs(os.path.join(self.session_dir, 'rgb'), exist_ok=True)
+        os.makedirs(os.path.join(self.session_dir, 'depth'), exist_ok=True)
+
         with open(os.path.join(self.session_dir, rgb_name), 'wb') as f:
             f.write(bytes(color_msg.data))
         with open(os.path.join(self.session_dir, depth_name), 'wb') as f:
@@ -409,6 +409,7 @@ class RGBDRecorder(Node):
     def _start_recording(self):
         # Reuse the session created at node startup. Append so starting a
         # second sequence does not erase the first sequence's metadata.
+        os.makedirs(self.session_dir, exist_ok=True)
         poses_path = os.path.join(self.session_dir, 'poses.txt')
         associations_path = os.path.join(self.session_dir, 'associations.txt')
         poses_needs_header = (
@@ -594,6 +595,9 @@ class RGBDRecorder(Node):
         depth_name = f'depth/{t_depth:.6f}.{self.depth_ext}'
 
         # Write the compressed payload byte-for-byte — no decode/re-encode.
+        os.makedirs(os.path.join(self.session_dir, 'rgb'), exist_ok=True)
+        os.makedirs(os.path.join(self.session_dir, 'depth'), exist_ok=True)
+
         with open(os.path.join(self.session_dir, rgb_name), 'wb') as f:
             f.write(bytes(color_msg.data))
         with open(os.path.join(self.session_dir, depth_name), 'wb') as f:
