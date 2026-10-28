@@ -119,11 +119,17 @@ class RGBDRecorder(Node):
             os.path.expanduser(gp('output_dir').value))
         os.makedirs(self.output_root, exist_ok=True)
 
+        # One session per process invocation, shared by sequences and captures.
+        session_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        self.session_dir = os.path.join(self.output_root, session_stamp)
+        os.makedirs(os.path.join(self.session_dir, 'rgb'), exist_ok=True)
+        os.makedirs(os.path.join(self.session_dir, 'depth'), exist_ok=True)
+
         # ---------------- State ----------------
         self._lock = threading.Lock()
+        self._metadata_file_lock = threading.Lock()
         self.recording = False
         self._single_capture_requested = False
-        self.session_dir = None
         self.poses_file = None
         self.assoc_file = None
         self.frame_count = 0
@@ -322,24 +328,20 @@ class RGBDRecorder(Node):
         self.bridge_qt.log_message.emit(msg)
 
     def _save_single_frame(self, color_msg, depth_msg):
-        """Save one RGB-D pair in its own timestamped directory."""
-        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        capture_dir = os.path.join(self.output_root, stamp)
-        rgb_dir = os.path.join(capture_dir, 'rgb')
-        depth_dir = os.path.join(capture_dir, 'depth')
-        os.makedirs(rgb_dir, exist_ok=True)
-        os.makedirs(depth_dir, exist_ok=True)
-
+        """Save one RGB-D pair in the current session directory."""
         t_color = stamp_to_sec(color_msg.header.stamp)
         t_depth = stamp_to_sec(depth_msg.header.stamp)
-        rgb_name = f'rgb/{t_color:.6f}.{self.color_ext}'
-        depth_name = f'depth/{t_depth:.6f}.{self.depth_ext}'
+        rgb_file = f'{t_color:.6f}.{self.color_ext}'
+        depth_file = f'{t_depth:.6f}.{self.depth_ext}'
+        rgb_name = f'rgb/{rgb_file}'
+        depth_name = f'depth/{depth_file}'
 
-        with open(os.path.join(capture_dir, rgb_name), 'wb') as f:
+        with open(os.path.join(self.session_dir, rgb_name), 'wb') as f:
             f.write(bytes(color_msg.data))
-        with open(os.path.join(capture_dir, depth_name), 'wb') as f:
+        with open(os.path.join(self.session_dir, depth_name), 'wb') as f:
             f.write(bytes(depth_msg.data))
 
+        # Camera calibration is shared by all data in this session.
         intr = {}
         if self.color_info:
             intr['color'] = self.camera_info_to_dict(self.color_info)
@@ -348,7 +350,7 @@ class RGBDRecorder(Node):
         intr['color_compressed_format'] = self.color_ext
         intr['depth_compressed_format'] = self.depth_ext
         intr['depth_unit'] = 'millimetres (16UC1)'
-        with open(os.path.join(capture_dir, 'intrinsics.json'), 'w') as f:
+        with open(os.path.join(self.session_dir, 'intrinsics.json'), 'w') as f:
             json.dump(intr, f, indent=2)
 
         if self.depth_to_color is not None:
@@ -357,23 +359,38 @@ class RGBDRecorder(Node):
                 'rotation': list(e.rotation),
                 'translation': list(e.translation),
             }}
-            with open(os.path.join(capture_dir, 'extrinsics.json'), 'w') as f:
+            with open(os.path.join(self.session_dir, 'extrinsics.json'), 'w') as f:
                 json.dump(extr, f, indent=2)
 
-        with open(os.path.join(capture_dir, 'associations.txt'), 'w') as f:
-            f.write(f'{t_color:.6f} {rgb_name} {t_depth:.6f} {depth_name}\\n')
+        cam_frame = self.camera_frame or color_msg.header.frame_id
+        pose = self.lookup_pose(cam_frame, color_msg.header.stamp)
 
-        with open(os.path.join(capture_dir, 'poses.txt'), 'w') as f:
-            f.write('# timestamp tx ty tz qx qy qz qw '
-                    f'({self.base_frame} -> camera)\\n')
-            cam_frame = self.camera_frame or color_msg.header.frame_id
-            pose = self.lookup_pose(cam_frame, color_msg.header.stamp)
-            if pose:
-                (tx, ty, tz), (qx, qy, qz, qw) = pose
-                f.write(f'{t_color:.6f} {tx:.6f} {ty:.6f} {tz:.6f} '
-                        f'{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\\n')
+        # Append captures to the same metadata files used for sequences.
+        # Serialize these writes with the sequence writer to avoid concurrent
+        # access and flush sequence writes before appending from this thread.
+        poses_path = os.path.join(self.session_dir, 'poses.txt')
+        associations_path = os.path.join(self.session_dir, 'associations.txt')
+        with self._metadata_file_lock:
+            if self.assoc_file is not None:
+                self.assoc_file.flush()
+            if self.poses_file is not None:
+                self.poses_file.flush()
 
-        msg = f'Single RGB-D pair saved -> {capture_dir}'
+            with open(associations_path, 'a') as f:
+                f.write(f'{t_color:.6f} {rgb_name} {t_depth:.6f} {depth_name}\n')
+
+            poses_needs_header = (
+                not os.path.exists(poses_path) or os.path.getsize(poses_path) == 0)
+            with open(poses_path, 'a') as f:
+                if poses_needs_header:
+                    f.write('# timestamp tx ty tz qx qy qz qw '
+                            f'({self.base_frame} -> camera)\n')
+                if pose:
+                    (tx, ty, tz), (qx, qy, qz, qw) = pose
+                    f.write(f'{t_color:.6f} {tx:.6f} {ty:.6f} {tz:.6f} '
+                            f'{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n')
+
+        msg = f'Single RGB-D pair saved -> {self.session_dir}'
         self.get_logger().info(msg)
         self.bridge_qt.log_message.emit(msg)
 
@@ -395,18 +412,17 @@ class RGBDRecorder(Node):
                 self._stop_recording()
 
     def _start_recording(self):
-        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.session_dir = os.path.join(self.output_root, stamp)
-        # Create the whole tree, including any missing parents
-        os.makedirs(os.path.join(self.session_dir, 'rgb'), exist_ok=True)
-        os.makedirs(os.path.join(self.session_dir, 'depth'), exist_ok=True)
-
-        self.poses_file = open(
-            os.path.join(self.session_dir, 'poses.txt'), 'w')
-        self.poses_file.write('# timestamp tx ty tz qx qy qz qw '
-                              f'({self.base_frame} -> camera)\n')
-        self.assoc_file = open(
-            os.path.join(self.session_dir, 'associations.txt'), 'w')
+        # Reuse the session created at node startup. Append so starting a
+        # second sequence does not erase the first sequence's metadata.
+        poses_path = os.path.join(self.session_dir, 'poses.txt')
+        associations_path = os.path.join(self.session_dir, 'associations.txt')
+        poses_needs_header = (
+            not os.path.exists(poses_path) or os.path.getsize(poses_path) == 0)
+        self.poses_file = open(poses_path, 'a')
+        if poses_needs_header:
+            self.poses_file.write('# timestamp tx ty tz qx qy qz qw '
+                                  f'({self.base_frame} -> camera)\\n')
+        self.assoc_file = open(associations_path, 'a')
 
         self.frame_count = 0
         self.metadata_written = False
@@ -437,10 +453,11 @@ class RGBDRecorder(Node):
         if self._writer_thread is not None:
             self._writer_thread.join()
 
-        for f in (self.poses_file, self.assoc_file):
-            if f:
-                f.close()
-        self.poses_file = self.assoc_file = None
+        with self._metadata_file_lock:
+            for f in (self.poses_file, self.assoc_file):
+                if f:
+                    f.close()
+            self.poses_file = self.assoc_file = None
         self._write_queue = None
         self._writer_thread = None
 
@@ -587,16 +604,18 @@ class RGBDRecorder(Node):
         with open(os.path.join(self.session_dir, depth_name), 'wb') as f:
             f.write(bytes(depth_msg.data))
 
-        self.assoc_file.write(
-            f'{t_color:.6f} {rgb_name} {t_depth:.6f} {depth_name}\n')
-
         cam_frame = self.camera_frame or color_msg.header.frame_id
         pose = self.lookup_pose(cam_frame, color_msg.header.stamp)
-        if pose:
-            (tx, ty, tz), (qx, qy, qz, qw) = pose
-            self.poses_file.write(
-                f'{t_color:.6f} {tx:.6f} {ty:.6f} {tz:.6f} '
-                f'{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n')
+        with self._metadata_file_lock:
+            self.assoc_file.write(
+                f'{t_color:.6f} {rgb_name} {t_depth:.6f} {depth_name}\n')
+            self.assoc_file.flush()
+            if pose:
+                (tx, ty, tz), (qx, qy, qz, qw) = pose
+                self.poses_file.write(
+                    f'{t_color:.6f} {tx:.6f} {ty:.6f} {tz:.6f} '
+                    f'{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n')
+                self.poses_file.flush()
 
         self.frame_count += 1
 
