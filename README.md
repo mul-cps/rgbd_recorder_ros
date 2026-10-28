@@ -5,6 +5,14 @@ extrinsics, visualises both streams side-by-side and records them as a
 standard RGB-D dataset. Recording is toggled with the **SPACE** key (or the
 `~/set_recording` SetBool service for headless use).
 
+## Installation
+
+On older ROS 2 distributions, you have to install `PySide6` manually via pip:
+```bash
+pip install PySide6
+```
+
+
 ## Usage
 
 Launch the node with default parameters:

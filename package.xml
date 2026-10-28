@@ -19,7 +19,7 @@
   <depend>tf2_ros</depend>
   <depend>python3-opencv</depend>
   <depend>python3-numpy</depend>
-  <depend>python3-pyside6</depend>
+  <depend condition="$ROS_DISTRO == 'lyrical'">python3-pyside6</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
