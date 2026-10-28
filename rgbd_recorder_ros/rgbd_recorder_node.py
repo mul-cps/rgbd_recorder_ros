@@ -8,6 +8,7 @@ RGB-D recorder node with Qt6 (PySide6) GUI — compressed transport version.
     * colour may be JPG or PNG, exported in its native format
 - Export writes the raw compressed payload byte-for-byte to disk
   (no decode/re-encode); decoding happens only for the live preview.
+- Optionally exports colourised depth images as PNG.
 - Also records intrinsics (CameraInfo), depth->colour extrinsics
   (orbbec_camera_msgs/Extrinsics, if available) and TF camera poses.
 - Reception watchdog: shows a GUI warning banner if no images arrive
@@ -18,6 +19,7 @@ Output layout:
     <output_dir>/<session_stamp>/
         rgb/<timestamp>.jpg|png      # exact bytes from the compressed topic
         depth/<timestamp>.png        # exact bytes from the compressed topic
+        depth_colourised/<timestamp>.png  # optional colourised depth
         intrinsics.json              # K, D, resolution (colour + depth)
         extrinsics.json              # depth->color from the driver
         poses.txt                    # TUM: t tx ty tz qx qy qz qw
@@ -102,6 +104,7 @@ class RGBDRecorder(Node):
         self.output_dir = self.declare_parameter('output_dir', '~/rgbd_dataset').value
         self.sync_slop = self.declare_parameter('sync_slop', 0.01).value
         self.depth_vis_max_mm = self.declare_parameter('depth_vis_max_mm', 5000.0).value
+        self.save_colourised_depth = self.declare_parameter('save_colourised_depth', True).value
         self.watchdog_timeout = self.declare_parameter('watchdog_timeout', 5.0).value
 
         # gp = self.get_parameter
@@ -319,6 +322,34 @@ class RGBDRecorder(Node):
         self.get_logger().info(msg)
         self.bridge_qt.log_message.emit(msg)
 
+    def _save_colourised_depth(self, depth_msg, timestamp):
+        """Optionally save the depth image colourised using the preview colormap."""
+        if not self.save_colourised_depth:
+            return
+
+        depth = cv2.imdecode(
+            np.frombuffer(depth_msg.data, np.uint8), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            self.get_logger().warning(
+                'Failed to decode depth image for colourised export')
+            return
+
+        depth_vis = cv2.convertScaleAbs(
+            depth, alpha=255.0 / self.depth_vis_max_mm)
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+
+        success, encoded = cv2.imencode('.png', depth_vis)
+        if not success:
+            self.get_logger().warning(
+                'Failed to encode colourised depth image')
+            return
+
+        colourised_dir = os.path.join(self.session_dir, 'depth_colourised')
+        os.makedirs(colourised_dir, exist_ok=True)
+        path = os.path.join(colourised_dir, f'{timestamp:.6f}.png')
+        with open(path, 'wb') as f:
+            f.write(encoded.tobytes())
+
     def _save_single_frame(self, color_msg, depth_msg):
         """Save one RGB-D pair in the current session directory."""
         t_color = stamp_to_sec(color_msg.header.stamp)
@@ -335,6 +366,8 @@ class RGBDRecorder(Node):
             f.write(bytes(color_msg.data))
         with open(os.path.join(self.session_dir, depth_name), 'wb') as f:
             f.write(bytes(depth_msg.data))
+
+        self._save_colourised_depth(depth_msg, t_depth)
 
         # Camera calibration is shared by all data in this session.
         intr = {}
@@ -602,6 +635,8 @@ class RGBDRecorder(Node):
             f.write(bytes(color_msg.data))
         with open(os.path.join(self.session_dir, depth_name), 'wb') as f:
             f.write(bytes(depth_msg.data))
+
+        self._save_colourised_depth(depth_msg, t_depth)
 
         cam_frame = self.camera_frame or color_msg.header.frame_id
         pose = self.lookup_pose(cam_frame, color_msg.header.stamp)
