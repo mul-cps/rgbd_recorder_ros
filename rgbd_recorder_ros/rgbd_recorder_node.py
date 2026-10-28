@@ -12,7 +12,7 @@ RGB-D recorder node with Qt6 (PySide6) GUI — compressed transport version.
   (orbbec_camera_msgs/Extrinsics, if available) and TF camera poses.
 - Reception watchdog: shows a GUI warning banner if no images arrive
   within `watchdog_timeout` seconds — from startup and during operation.
-- SPACE toggles recording, Q/ESC quits. Output dirs created automatically.
+- SPACE toggles sequence recording; C saves one synchronized RGB-D pair; Q/ESC quits.
 
 Output layout:
     <output_dir>/<session_stamp>/
@@ -122,6 +122,7 @@ class RGBDRecorder(Node):
         # ---------------- State ----------------
         self._lock = threading.Lock()
         self.recording = False
+        self._single_capture_requested = False
         self.session_dir = None
         self.poses_file = None
         self.assoc_file = None
@@ -312,6 +313,70 @@ class RGBDRecorder(Node):
             f'Formats validated: colour={color_fmt}, depth={depth_fmt}')
         return True
 
+    def request_single_capture(self):
+        """Save the next synchronized RGB-D pair as an individual capture."""
+        with self._lock:
+            self._single_capture_requested = True
+        msg = 'Single RGB-D capture requested; waiting for next synchronized pair.'
+        self.get_logger().info(msg)
+        self.bridge_qt.log_message.emit(msg)
+
+    def _save_single_frame(self, color_msg, depth_msg):
+        """Save one RGB-D pair in its own timestamped directory."""
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        capture_dir = os.path.join(self.output_root, stamp)
+        rgb_dir = os.path.join(capture_dir, 'rgb')
+        depth_dir = os.path.join(capture_dir, 'depth')
+        os.makedirs(rgb_dir, exist_ok=True)
+        os.makedirs(depth_dir, exist_ok=True)
+
+        t_color = stamp_to_sec(color_msg.header.stamp)
+        t_depth = stamp_to_sec(depth_msg.header.stamp)
+        rgb_name = f'rgb/{t_color:.6f}.{self.color_ext}'
+        depth_name = f'depth/{t_depth:.6f}.{self.depth_ext}'
+
+        with open(os.path.join(capture_dir, rgb_name), 'wb') as f:
+            f.write(bytes(color_msg.data))
+        with open(os.path.join(capture_dir, depth_name), 'wb') as f:
+            f.write(bytes(depth_msg.data))
+
+        intr = {}
+        if self.color_info:
+            intr['color'] = self.camera_info_to_dict(self.color_info)
+        if self.depth_info:
+            intr['depth'] = self.camera_info_to_dict(self.depth_info)
+        intr['color_compressed_format'] = self.color_ext
+        intr['depth_compressed_format'] = self.depth_ext
+        intr['depth_unit'] = 'millimetres (16UC1)'
+        with open(os.path.join(capture_dir, 'intrinsics.json'), 'w') as f:
+            json.dump(intr, f, indent=2)
+
+        if self.depth_to_color is not None:
+            e = self.depth_to_color
+            extr = {'depth_to_color': {
+                'rotation': list(e.rotation),
+                'translation': list(e.translation),
+            }}
+            with open(os.path.join(capture_dir, 'extrinsics.json'), 'w') as f:
+                json.dump(extr, f, indent=2)
+
+        with open(os.path.join(capture_dir, 'associations.txt'), 'w') as f:
+            f.write(f'{t_color:.6f} {rgb_name} {t_depth:.6f} {depth_name}\\n')
+
+        with open(os.path.join(capture_dir, 'poses.txt'), 'w') as f:
+            f.write('# timestamp tx ty tz qx qy qz qw '
+                    f'({self.base_frame} -> camera)\\n')
+            cam_frame = self.camera_frame or color_msg.header.frame_id
+            pose = self.lookup_pose(cam_frame, color_msg.header.stamp)
+            if pose:
+                (tx, ty, tz), (qx, qy, qz, qw) = pose
+                f.write(f'{t_color:.6f} {tx:.6f} {ty:.6f} {tz:.6f} '
+                        f'{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\\n')
+
+        msg = f'Single RGB-D pair saved -> {capture_dir}'
+        self.get_logger().info(msg)
+        self.bridge_qt.log_message.emit(msg)
+
     # ------------------------------------------------------------------ #
     #  Recording control (callable from GUI thread and service)          #
     # ------------------------------------------------------------------ #
@@ -463,6 +528,9 @@ class RGBDRecorder(Node):
         # ---- Export: enqueue raw messages; never do disk I/O here ----
         with self._lock:
             rec = self.recording
+            capture_single = self._single_capture_requested
+            if capture_single:
+                self._single_capture_requested = False
             if rec and self._write_queue is not None:
                 try:
                     self._write_queue.put_nowait(
@@ -475,6 +543,13 @@ class RGBDRecorder(Node):
                             f'Recording queue full; dropped '
                             f'{self._dropped_frames} RGB-D pairs.')
             count = self.frame_count
+
+        if capture_single:
+            threading.Thread(
+                target=self._save_single_frame,
+                args=(color_msg, depth_msg),
+                name='rgbd-single-capture',
+                daemon=True).start()
 
         # ---- Preview: decode only for display ----
         color = cv2.imdecode(
@@ -552,7 +627,7 @@ class RecorderWindow(QMainWindow):
         self.rec_dot.setFixedSize(22, 22)
         self._set_dot(False)
 
-        self.rec_text = QLabel('IDLE — press SPACE to record')
+        self.rec_text = QLabel('IDLE — SPACE: record sequence | C: capture pair')
         f = QFont()
         f.setPointSize(12)
         f.setBold(True)
@@ -581,7 +656,7 @@ class RecorderWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage(
-            'SPACE: start/stop recording   |   Q / ESC: quit')
+            'SPACE: start/stop sequence   |   C: save one RGB-D pair   |   Q / ESC: quit')
 
         # --- signals from ROS thread (queued connections) ---
         bridge.frame_ready.connect(self.on_frame)
@@ -675,7 +750,7 @@ class RecorderWindow(QMainWindow):
             self.setWindowTitle(
                 f'RGB-D Recorder — ● REC ({frame_count} frames)')
         else:
-            self.rec_text.setText('IDLE — press SPACE to record')
+            self.rec_text.setText('IDLE — SPACE: record sequence | C: capture pair')
             self.rec_text.setStyleSheet('color: #cccccc;')
             self.image_label.setStyleSheet(
                 'background-color: #202020; border: none;')
@@ -688,6 +763,8 @@ class RecorderWindow(QMainWindow):
         key = event.key()
         if key == Qt.Key_Space:
             self.node.toggle_recording()
+        elif key == Qt.Key_C:
+            self.node.request_single_capture()
         elif key in (Qt.Key_Q, Qt.Key_Escape):
             self.close()
         else:
