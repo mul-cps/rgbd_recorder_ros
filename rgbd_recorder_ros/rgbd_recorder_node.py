@@ -97,26 +97,16 @@ class RGBDRecorder(Node):
         self.bridge_qt = bridge
 
         # ---------------- Parameters ----------------
-        self.declare_parameter('color_topic',
-                               '/camera/color/image_raw/compressed')
-        self.declare_parameter('depth_topic',
-                               '/camera/depth/image_raw/compressed')
-        self.declare_parameter('color_info_topic', '/camera/color/camera_info')
-        self.declare_parameter('depth_info_topic', '/camera/depth/camera_info')
-        self.declare_parameter('extrinsics_topic', '/camera/depth_to_color')
-        self.declare_parameter('base_frame', 'map')
-        self.declare_parameter('camera_frame', '')   # empty -> header frame_id
-        self.declare_parameter('output_dir', '~/rgbd_dataset')
-        self.declare_parameter('sync_slop', 0.01)
-        self.declare_parameter('depth_vis_max_mm', 5000.0)
-        self.declare_parameter('watchdog_timeout', 5.0)
+        self.base_frame = self.declare_parameter('base_frame', 'map').value
+        self.camera_frame = self.declare_parameter('camera_frame', '').value   # empty -> header frame_id
+        self.output_dir = self.declare_parameter('output_dir', '~/rgbd_dataset').value
+        self.sync_slop = self.declare_parameter('sync_slop', 0.01).value
+        self.depth_vis_max_mm = self.declare_parameter('depth_vis_max_mm', 5000.0).value
+        self.watchdog_timeout = self.declare_parameter('watchdog_timeout', 5.0).value
 
-        gp = self.get_parameter
-        self.base_frame = gp('base_frame').value
-        self.camera_frame = gp('camera_frame').value
+        # gp = self.get_parameter
         # Expand ~ and env vars, create the root folder right away
-        self.output_root = os.path.expandvars(
-            os.path.expanduser(gp('output_dir').value))
+        self.output_root = os.path.expandvars(os.path.expanduser(self.output_dir))
         os.makedirs(self.output_root, exist_ok=True)
 
         # One session per process invocation, shared by sequences and captures.
@@ -156,6 +146,12 @@ class RGBDRecorder(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ---------------- Subscribers ----------------
+        self.color_topic = '/camera/color/image_raw/compressed'
+        self.depth_topic = '/camera/depth/image_raw/compressed'
+        self.color_info_topic = '/camera/color/camera_info'
+        self.depth_info_topic = '/camera/depth/camera_info'
+        self.extrinsics_topic = '/camera/depth_to_color'
+
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         # message_filters is NOT thread-safe: force colour/depth callbacks
@@ -170,10 +166,10 @@ class RGBDRecorder(Node):
         self._last_depth_stamp = 0.0
 
         self.color_sub = Subscriber(
-            self, CompressedImage, gp('color_topic').value,
+            self, CompressedImage, self.color_topic,
             qos_profile=qos, callback_group=self.sync_group)
         self.depth_sub = Subscriber(
-            self, CompressedImage, gp('depth_topic').value,
+            self, CompressedImage, self.depth_topic,
             qos_profile=qos, callback_group=self.sync_group)
 
         # Count raw arrivals without disturbing the synchronizer
@@ -182,17 +178,17 @@ class RGBDRecorder(Node):
 
         self.sync = ApproximateTimeSynchronizer(
             [self.color_sub, self.depth_sub],
-            queue_size=10, slop=gp('sync_slop').value)
+            queue_size=10, slop=self.sync_slop)
         self.sync.registerCallback(self.rgbd_callback)
 
-        self.create_subscription(CameraInfo, gp('color_info_topic').value,
+        self.create_subscription(CameraInfo, self.color_info_topic,
                                  self.color_info_cb, qos)
-        self.create_subscription(CameraInfo, gp('depth_info_topic').value,
+        self.create_subscription(CameraInfo, self.depth_info_topic,
                                  self.depth_info_cb, qos)
 
         if HAVE_ORBBEC_MSGS:
             self.create_subscription(
-                OrbbecExtrinsics, gp('extrinsics_topic').value,
+                OrbbecExtrinsics, self.extrinsics_topic,
                 self.extrinsics_cb, qos)
         else:
             self.get_logger().warning(
@@ -205,7 +201,6 @@ class RGBDRecorder(Node):
         self.diag_timer = self.create_timer(3.0, self._diag)
 
         # ---------------- Reception watchdog ----------------
-        self.watchdog_timeout = gp('watchdog_timeout').value
         # Initialise to "now" so the watchdog also triggers if NOTHING
         # ever arrives after startup.
         self._last_rx_time_color = self.get_clock().now()
@@ -745,8 +740,7 @@ class RecorderWindow(QMainWindow):
 
         # depth -> colormap
         depth_vis = cv2.convertScaleAbs(
-            depth_mm, alpha=255.0 / self.node.get_parameter(
-                'depth_vis_max_mm').value)
+            depth_mm, alpha=255.0 / self.node.depth_vis_max_mm)
         depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
         if depth_vis.shape[:2] != color.shape[:2]:
             depth_vis = cv2.resize(depth_vis,
