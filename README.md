@@ -7,9 +7,18 @@ standard RGB-D dataset. Recording is toggled with the **SPACE** key (or the
 
 ## Usage
 
+Launch the node with default parameters:
 ```bash
 ros2 run rgbd_recorder_ros rgbd_recorder
 ```
+
+Launch the node with custom output folder and maximum visualisation depth:
+```bash
+ros2 run rgbd_recorder_ros rgbd_recorder --ros-args \
+  -p output_dir:=~/rgbd_dataset/ \
+  -p depth_vis_max_mm:=2000.0
+```
+
 
 ## Topics
 
